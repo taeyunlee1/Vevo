@@ -1,0 +1,37 @@
+import librosa
+
+def get_frame_range_from_time(wav_path, start_sec, end_sec, hop_length=256, sr=24000):
+    """
+    Converts time range in seconds to frame index range in FM latents.
+
+    Parameters:
+    - wav_path: path to .wav file
+    - start_sec, end_sec: region in seconds
+    - hop_length: hop size used for mel spectrogram (usually 256)
+    - sr: sample rate of the audio
+
+    Returns:
+    - (start_frame, end_frame)
+    """
+    y, _ = librosa.load(wav_path, sr=sr)
+    total_frames = (len(y) // hop_length)
+    total_duration = len(y) / sr
+
+    start_frame = int(start_sec * sr / hop_length)
+    end_frame = int(end_sec * sr / hop_length)
+
+    print(f"Total duration: {total_duration:.2f}s")
+    print(f"Total frames: {total_frames}")
+    print(f"Selected frame range: {start_frame} to {end_frame}")
+
+    return start_frame, end_frame
+
+
+region = get_frame_range_from_time(
+    "models/vc/vevo/wav/output_vevotts1.wav",
+    start_sec=4.5,
+    end_sec=5.0,
+)
+
+cfg_scale = 2.0
+inference_pipeline.run_fm(..., region=(421, 468), cfg_scale=cfg_scale)
