@@ -1,0 +1,129 @@
+# Copyright (c) 2023 Amphion.
+# This source code is licensed under the MIT license found in the LICENSE file.
+
+import os
+import torch
+from huggingface_hub import snapshot_download
+
+from models.vc.vevo.vevo_utils import *
+
+def vevo_tts(
+    src_text,
+    ref_wav_path,
+    timbre_ref_wav_path=None,
+    output_path=None,
+    ref_text=None,
+    src_language="en",
+    ref_language="en",
+    ar_cache_path=None,
+    fm_eps_path=None,
+    cfg_scale=0.0,
+    region=None,
+    blend_wav_path=None,
+):
+    if timbre_ref_wav_path is None:
+        timbre_ref_wav_path = ref_wav_path
+
+    if ar_cache_path and os.path.exists(ar_cache_path):
+        ar = load_ar_output(ar_cache_path)
+    else:
+        ar = inference_pipeline.run_ar(
+            src_text,
+            ref_wav_path,
+            ref_text,
+            src_language,
+            ref_language,
+        )
+        if ar_cache_path:
+            save_ar_output(ar, ar_cache_path)
+
+    if fm_eps_path and os.path.exists(fm_eps_path):
+        bad_eps = load_fm_eps(fm_eps_path)
+    else:
+        bad_eps = None
+
+    gen_audio = inference_pipeline.run_fm(
+        predicted_codecs=ar,
+        timbre_ref_wav_path=timbre_ref_wav_path,
+        bad_eps=bad_eps,
+        region=region,
+        cfg_scale=cfg_scale,
+        blend_wav_path=blend_wav_path,
+    )
+
+    assert output_path is not None
+    save_audio(gen_audio, output_path=output_path)
+
+
+if __name__ == "__main__":
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+    # Download tokenizer
+    local_dir = snapshot_download(
+        repo_id="amphion/Vevo",
+        repo_type="model",
+        cache_dir="./ckpts/Vevo",
+        allow_patterns=["tokenizer/vq8192/*"],
+    )
+    content_style_tokenizer_ckpt_path = os.path.join(local_dir, "tokenizer/vq8192")
+
+    # AR transformer
+    local_dir = snapshot_download(
+        repo_id="amphion/Vevo",
+        repo_type="model",
+        cache_dir="./ckpts/Vevo",
+        allow_patterns=["contentstyle_modeling/PhoneToVq8192/*"],
+    )
+    ar_cfg_path = "./models/vc/vevo/config/PhoneToVq8192.json"
+    ar_ckpt_path = os.path.join(local_dir, "contentstyle_modeling/PhoneToVq8192")
+
+    # FMT
+    local_dir = snapshot_download(
+        repo_id="amphion/Vevo",
+        repo_type="model",
+        cache_dir="./ckpts/Vevo",
+        allow_patterns=["acoustic_modeling/Vq8192ToMels/*"],
+    )
+    fmt_cfg_path = "./models/vc/vevo/config/Vq8192ToMels.json"
+    fmt_ckpt_path = os.path.join(local_dir, "acoustic_modeling/Vq8192ToMels")
+
+    # Vocoder
+    local_dir = snapshot_download(
+        repo_id="amphion/Vevo",
+        repo_type="model",
+        cache_dir="./ckpts/Vevo",
+        allow_patterns=["acoustic_modeling/Vocoder/*"],
+    )
+    vocoder_cfg_path = "./models/vc/vevo/config/Vocoder.json"
+    vocoder_ckpt_path = os.path.join(local_dir, "acoustic_modeling/Vocoder")
+
+    inference_pipeline = VevoInferencePipeline(
+        content_style_tokenizer_ckpt_path=content_style_tokenizer_ckpt_path,
+        ar_cfg_path=ar_cfg_path,
+        ar_ckpt_path=ar_ckpt_path,
+        fmt_cfg_path=fmt_cfg_path,
+        fmt_ckpt_path=fmt_ckpt_path,
+        vocoder_cfg_path=vocoder_cfg_path,
+        vocoder_ckpt_path=vocoder_ckpt_path,
+        device=device,
+    )
+
+    src_text = "I don't really care what you call me. I've been a silent spectator, watching species evolve, empires rise and fall. But always remember, I am mighty and enduring. Respect me and I'll nurture you; ignore me and you shall face the consequences."
+
+    ref_wav_path = "./models/vc/vevo/wav/arabic_male.wav"
+    ref_text = "Flip stood undecided, his ears strained to catch the slightest sound."
+    blend_wav_path = "./models/vc/vevo/wav/mandarin_female.wav"
+
+    vevo_tts(
+        src_text,
+        ref_wav_path=ref_wav_path,
+        output_path="./models/vc/vevo/wav/output_cfg_blend.wav",
+        ref_text=ref_text,
+        src_language="en",
+        ref_language="en",
+        ar_cache_path="./models/vc/vevo/wav/ar.pt",
+        fm_eps_path=None,
+        cfg_scale=0.5,
+        region=(120, 180),
+        blend_wav_path=blend_wav_path,
+    )
