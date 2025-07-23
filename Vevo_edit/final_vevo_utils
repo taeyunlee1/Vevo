@@ -1,0 +1,167 @@
+# Copyright (c) 2023 Amphion.
+# MIT License.
+
+import math
+import librosa
+import torch
+import torchaudio
+import accelerate
+import safetensors
+import numpy as np
+import yaml
+from IPython.display import display, Audio
+
+from models.vc.flow_matching_transformer.fmt_model import FlowMatchingTransformer
+from models.vc.autoregressive_transformer.ar_model import AutoregressiveTransformer
+from models.codec.kmeans.repcodec_model import RepCodec
+from models.codec.vevo.vevo_repcodec import VevoRepCodec
+from models.codec.melvqgan.melspec import MelSpectrogram
+from models.codec.amphion_codec.vocos import Vocos
+
+from utils.util import load_config
+
+
+def g2p_(text, language):
+    from models.tts.maskgct.g2p.g2p_generation import g2p, chn_eng_g2p
+    return chn_eng_g2p(text) if language in ["zh", "en"] else g2p(text, None, language)
+
+
+def save_audio(waveform, sr=24000, output_path=None, target_sample_rate=None, target_db=-25.0):
+    if target_sample_rate and sr != target_sample_rate:
+        waveform = torchaudio.transforms.Resample(sr, target_sample_rate)(waveform)
+    rms = torch.sqrt(torch.mean(waveform ** 2))
+    gain = target_db - 20 * torch.log10(rms + 1e-9)
+    waveform = waveform * (10 ** (gain / 20))
+    torchaudio.save(output_path, waveform, target_sample_rate or sr)
+    return output_path
+
+
+def load_wav(wav_path, device):
+    speech = librosa.load(wav_path, sr=24000)[0]
+    speech_tensor = torch.tensor(speech).unsqueeze(0).to(device)
+    speech16k = torchaudio.functional.resample(speech_tensor, 24000, 16000)
+    return speech, speech_tensor, speech16k
+
+
+def load_checkpoint(build_fn, cfg, ckpt_path, device):
+    model = build_fn(cfg, device)
+    accelerate.load_checkpoint_and_dispatch(model, ckpt_path)
+    return model
+
+
+def build_hubert_model(device):
+    model = torchaudio.pipelines.HUBERT_LARGE.get_model().to(device).eval()
+    return model
+
+
+def build_vqvae_model(cfg, device):
+    model = RepCodec(cfg=cfg).to(device).eval()
+    return model
+
+
+def build_ar_model(cfg, device):
+    model = AutoregressiveTransformer(cfg=cfg.model.autoregressive_transformer).to(device).eval()
+    return model
+
+
+def build_fmt_model(cfg, device):
+    model = FlowMatchingTransformer(cfg=cfg.model.flow_matching_transformer).to(device).eval()
+    return model
+
+
+def build_mel_model(cfg, device):
+    mel = MelSpectrogram(
+        sampling_rate=cfg.preprocess.sample_rate,
+        n_fft=cfg.preprocess.n_fft,
+        num_mels=cfg.preprocess.num_mels,
+        hop_size=cfg.preprocess.hop_size,
+        win_size=cfg.preprocess.win_size,
+        fmin=cfg.preprocess.fmin,
+        fmax=cfg.preprocess.fmax,
+    ).to(device).eval()
+    return mel
+
+
+def build_vocoder_model(cfg, device):
+    return Vocos(cfg=cfg.model.vocos).to(device).eval()
+
+
+class VevoInferencePipeline:
+    def __init__(self, content_style_tokenizer_ckpt_path, ar_cfg_path, ar_ckpt_path,
+                 fmt_cfg_path, fmt_ckpt_path, vocoder_cfg_path, vocoder_ckpt_path, device):
+        self.device = device
+
+        self.ar_cfg = load_config(ar_cfg_path)
+        self.ar_model = load_checkpoint(build_ar_model, self.ar_cfg, ar_ckpt_path, device)
+
+        self.fmt_cfg = load_config(fmt_cfg_path)
+        self.fmt_model = load_checkpoint(build_fmt_model, self.fmt_cfg, fmt_ckpt_path, device)
+
+        self.vocoder_cfg = load_config(vocoder_cfg_path)
+        self.mel_model = build_mel_model(self.vocoder_cfg, device)
+        self.vocoder_model = load_checkpoint(build_vocoder_model, self.vocoder_cfg, vocoder_ckpt_path, device)
+
+        self.hubert_model = build_hubert_model(device)
+        stat = np.load(self.fmt_cfg.model.representation_stat_mean_var_path)
+        self.hubert_feat_norm_mean = torch.tensor(stat["mean"])
+        self.hubert_feat_norm_std = torch.tensor(stat["std"])
+
+        self.content_style_tokenizer = load_checkpoint(
+            build_vqvae_model,
+            self.fmt_cfg.model.repcodec,
+            content_style_tokenizer_ckpt_path,
+            device,
+        )
+
+    def extract_mel_feature(self, speech):
+        mel = self.mel_model(speech).transpose(1, 2)
+        return (mel - self.vocoder_cfg.preprocess.mel_mean) / math.sqrt(self.vocoder_cfg.preprocess.mel_var)
+
+    def extract_hubert_feature(self, wavs):
+        feats, feat_lengths = self.hubert_model.extract_features(wavs, lengths=None)
+        return feats[-1], feat_lengths
+
+    def extract_hubert_codec(self, wavs):
+        feats, _ = self.extract_hubert_feature(wavs)
+        feats = (feats - self.hubert_feat_norm_mean.to(feats)) / self.hubert_feat_norm_std.to(feats)
+        codecs, _ = self.content_style_tokenizer.quantize(feats)
+        return codecs
+
+    def run_ar(self, src_text, style_ref_wav_path, style_ref_text, src_lang, ref_lang):
+        style_ref_speech, _, style_ref_speech16k = load_wav(style_ref_wav_path, self.device)
+        ref_ids = g2p_(style_ref_text, ref_lang)[1]
+        src_ids = g2p_(src_text, src_lang)[1]
+        ids = torch.tensor([ref_ids + src_ids], dtype=torch.long).to(self.device)
+
+        with torch.no_grad():
+            prompt_mels = self.extract_mel_feature(style_ref_speech16k)
+            pred_codecs = self.ar_model.generate(input_ids=ids, prompt_output_ids=torch.tensor([ref_ids]).to(self.device), prompt_mels=prompt_mels)
+        return pred_codecs
+
+    def run_fm(self, predicted_codecs, timbre_ref_wav_path, bad_eps=None, region=None, cfg_scale=0.0, flow_matching_steps=32, blend_wav_path=None):
+        timbre_speech, timbre_speech24k, timbre_speech16k = load_wav(timbre_ref_wav_path, self.device)
+        timbre_codecs = self.extract_hubert_codec(timbre_speech16k)
+        cond = self.fmt_model.cond_emb(torch.cat([timbre_codecs, predicted_codecs], dim=1))
+        prompt = self.extract_mel_feature(timbre_speech24k)
+
+        with torch.no_grad():
+            pred = self.fmt_model.reverse_diffusion(cond=cond, prompt=prompt, n_timesteps=flow_matching_steps)
+            if blend_wav_path:
+                blend_speech, blend_speech24k, _ = load_wav(blend_wav_path, self.device)
+                blend_prompt = self.extract_mel_feature(blend_speech24k)
+                blend_pred = self.fmt_model.reverse_diffusion(cond=cond, prompt=blend_prompt, n_timesteps=flow_matching_steps)
+            else:
+                blend_pred = None
+
+            if cfg_scale > 0 and region:
+                start, end = region
+                if blend_pred is not None:
+                    pred[:, start:end, :] = (1 - cfg_scale) * pred[:, start:end, :] + cfg_scale * blend_pred[:, start:end, :]
+                elif bad_eps is not None:
+                    guided = pred[:, start:end, :] + cfg_scale * (pred[:, start:end, :] - bad_eps[:, start:end, :])
+                    guided = torch.clamp(guided, -1.5, 1.5)
+                    pred[:, start:end, :] = (1 - cfg_scale) * pred[:, start:end, :] + cfg_scale * guided
+
+        mel = pred.transpose(1, 2)
+        audio = self.vocoder_model(mel).detach().cpu()[0]
+        return audio
