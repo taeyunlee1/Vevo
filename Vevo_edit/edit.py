@@ -1,3 +1,55 @@
+def run_fm(self, predicted_codecs, timbre_ref_wav_path, bad_eps=None, region=None, cfg_scale=0.0, flow_matching_steps=32, blend_wav_path=None):
+    timbre_speech, timbre_speech24k, timbre_speech16k = load_wav(timbre_ref_wav_path, self.device)
+    timbre_codecs = self.extract_hubert_codec(timbre_speech16k)
+    cond = self.fmt_model.cond_emb(torch.cat([timbre_codecs, predicted_codecs], dim=1))
+    prompt = self.extract_mel_feature(timbre_speech24k)
+
+    with torch.no_grad():
+        pred = self.fmt_model.reverse_diffusion(
+            cond=cond,
+            prompt=prompt,
+            n_timesteps=flow_matching_steps,
+        )
+
+        # Optional second prompt for blending
+        if blend_wav_path:
+            blend_speech, blend_speech24k, _ = load_wav(blend_wav_path, self.device)
+            blend_prompt = self.extract_mel_feature(blend_speech24k)
+            blend_pred = self.fmt_model.reverse_diffusion(
+                cond=cond,
+                prompt=blend_prompt,
+                n_timesteps=flow_matching_steps,
+            )
+        else:
+            blend_pred = None
+
+        # Handle mismatch in time dimension
+        if blend_pred is not None and blend_pred.shape[1] != pred.shape[1]:
+            min_len = min(pred.shape[1], blend_pred.shape[1])
+            print(f"[CFG Warning] Length mismatch — cropping both to {min_len} frames")
+            pred = pred[:, :min_len, :]
+            blend_pred = blend_pred[:, :min_len, :]
+
+        # Region-based CFG/blending
+        if cfg_scale > 0.0 and region is not None:
+            start, end = region
+            if end > pred.shape[1]:
+                raise ValueError(f"Region end={end} exceeds available mel length={pred.shape[1]}")
+            
+            if blend_pred is not None:
+                pred[:, start:end, :] = (
+                    (1 - cfg_scale) * pred[:, start:end, :] + cfg_scale * blend_pred[:, start:end, :]
+                )
+            elif bad_eps is not None:
+                guided = pred[:, start:end, :] + cfg_scale * (pred[:, start:end, :] - bad_eps[:, start:end, :])
+                guided = torch.clamp(guided, -1.5, 1.5)
+                pred[:, start:end, :] = (1 - cfg_scale) * pred[:, start:end, :] + cfg_scale * guided
+
+    mel = pred.transpose(1, 2)
+    audio = self.vocoder_model(mel).detach().cpu()[0]
+    return audio
+
+
 # PATCHED `vevo_utils.py`
 
 # Add this method to VevoInferencePipeline
