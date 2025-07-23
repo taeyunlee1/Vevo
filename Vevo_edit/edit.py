@@ -1,3 +1,15 @@
+
+def extract_prompt_mel_feature(self, speech):
+    """
+    Extract normalized mel for the AR model's prompt encoder.
+    """
+    if not hasattr(self, "prompt_mel_model"):
+        self.prompt_mel_model = build_mel_model(self.ar_cfg, self.device)
+
+    mel = self.prompt_mel_model(speech).transpose(1, 2)
+    mel = (mel - self.ar_cfg.preprocess.mel_mean) / math.sqrt(self.ar_cfg.preprocess.mel_var)
+    return mel
+
 # Copyright (c) 2023 Amphion.
 # MIT License
 
