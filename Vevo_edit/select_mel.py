@@ -1,50 +1,38 @@
-import torch
-import torchaudio
-import matplotlib.pyplot as plt
-from matplotlib.widgets import SpanSelector
+import whisper
 
-# ====== CONFIG ======
-WAV_PATH = "./models/vc/vevo/wav/output_vevotts1.wav"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+def transcribe_with_word_timestamps(audio_path, model_size="medium"):
+    model = whisper.load_model(model_size)
+    result = model.transcribe(audio_path, word_timestamps=True, verbose=False)
 
-# ====== Mel Extractor from Vevo ======
-from models.vc.vevo.vevo_utils import VevoInferencePipeline
-from models.vc.vevo.infer_vevotts import inference_pipeline  # make sure this is initialized
+    word_times = []
+    for segment in result["segments"]:
+        for word_info in segment["words"]:
+            word = word_info["word"].strip()
+            start = word_info["start"]
+            end = word_info["end"]
+            word_times.append((word, start, end))
 
-# ====== Load and convert to Mel ======
-waveform, sr = torchaudio.load(WAV_PATH)
-mel = inference_pipeline.extract_mel_feature(waveform.to(DEVICE)).squeeze(0).cpu()
+    return word_times
 
-# ====== Interactive Display ======
-selected = {}
+# Example usage:
+timestamps = transcribe_with_word_timestamps("output_ar_inpaint.wav")
+for word, start, end in timestamps:
+    print(f"{word:15} {start:.2f} sec → {end:.2f} sec")
 
-def onselect(xmin, xmax):
-    selected['start'] = int(xmin)
-    selected['end'] = int(xmax)
-    print(f"Selected mel frame region: start={selected['start']}, end={selected['end']}")
-
-fig, ax = plt.subplots(figsize=(12, 4))
-ax.imshow(mel.T, aspect="auto", origin="lower", cmap="magma")
-ax.set_title("Select Region to Regenerate with CFG")
-ax.set_xlabel("Frame Index")
-ax.set_ylabel("Mel Channel")
-span = SpanSelector(ax, onselect, 'horizontal', useblit=True,
-                    props=dict(alpha=0.5, facecolor='red'),
-                    interactive=True)
-plt.show()
-
-# After selecting the region, you'll see output like:
-# Selected mel frame region: start=540, end=600
-
-vevo_tts(
-    src_text,
-    ref_wav_path,
-    timbre_ref_wav_path="./models/vc/vevo/wav/mandarin_female.wav",
-    output_path="./models/vc/vevo/wav/output_vevotts2.wav",
-    ref_text=ref_text,
-    src_language="en",
-    ref_language="en",
-    use_cfg=True,
-    cfg_region=(720, 800),  # regenerate only this part with CFG
-    cfg_scale=2.0,
-)
+def seconds_to_ar_token_range(start_time, end_time, num_tokens, audio_duration):
+    """
+    Map a (start_time, end_time) to AR token indices.
+    
+    Args:
+        start_time (float): start of word/phrase in seconds
+        end_time (float): end of word/phrase in seconds
+        num_tokens (int): total number of AR tokens
+        audio_duration (float): total duration of the generated audio (in seconds)
+        
+    Returns:
+        tuple of (start_index, end_index) for AR token slicing
+    """
+    tokens_per_sec = num_tokens / audio_duration
+    start_idx = int(start_time * tokens_per_sec)
+    end_idx = int(end_time * tokens_per_sec)
+    return start_idx, end_idx
