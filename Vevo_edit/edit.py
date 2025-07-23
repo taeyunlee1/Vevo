@@ -1,3 +1,122 @@
+# Copyright (c) 2023 Amphion.
+# MIT License
+
+import os
+import torch
+from huggingface_hub import snapshot_download
+from models.vc.vevo.vevo_utils import (
+    VevoInferencePipeline,
+    save_audio,
+)
+
+def vevo_inpaint_ar(
+    src_text,
+    ref_wav_path,
+    ref_text,
+    blend_text,
+    output_path,
+    src_language="en",
+    ref_language="en",
+    region_tokens=(10, 20),
+):
+    # Generate original AR tokens and get the boundary
+    ar_tokens, ref_len = inference_pipeline.run_ar(
+        src_text=src_text,
+        style_ref_wav_path=ref_wav_path,
+        style_ref_text=ref_text,
+        src_lang=src_language,
+        ref_lang=ref_language,
+    )
+
+    # Generate alternative AR tokens (e.g., from modified reference)
+    new_tokens, _ = inference_pipeline.run_ar(
+        src_text=src_text,
+        style_ref_wav_path=ref_wav_path,
+        style_ref_text=blend_text,
+        src_lang=src_language,
+        ref_lang=ref_language,
+    )
+
+    # Inpaint selected region
+    ar_tokens[:, ref_len + region_tokens[0]:ref_len + region_tokens[1]] =         new_tokens[:, ref_len + region_tokens[0]:ref_len + region_tokens[1]]
+
+    # Generate audio from updated tokens
+    gen_audio = inference_pipeline.run_fm_with_ar_tokens(
+        ar_tokens=ar_tokens,
+        timbre_ref_wav_path=ref_wav_path,
+    )
+
+    save_audio(gen_audio, output_path=output_path)
+
+
+if __name__ == "__main__":
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+    # Snapshot loading
+    local_dir = snapshot_download(
+        repo_id="amphion/Vevo",
+        repo_type="model",
+        cache_dir="./ckpts/Vevo",
+        allow_patterns=["tokenizer/vq8192/*"],
+    )
+    content_style_tokenizer_ckpt_path = os.path.join(local_dir, "tokenizer/vq8192")
+
+    local_dir = snapshot_download(
+        repo_id="amphion/Vevo",
+        repo_type="model",
+        cache_dir="./ckpts/Vevo",
+        allow_patterns=["contentstyle_modeling/PhoneToVq8192/*"],
+    )
+    ar_cfg_path = "./models/vc/vevo/config/PhoneToVq8192.json"
+    ar_ckpt_path = os.path.join(local_dir, "contentstyle_modeling/PhoneToVq8192")
+
+    local_dir = snapshot_download(
+        repo_id="amphion/Vevo",
+        repo_type="model",
+        cache_dir="./ckpts/Vevo",
+        allow_patterns=["acoustic_modeling/Vq8192ToMels/*"],
+    )
+    fmt_cfg_path = "./models/vc/vevo/config/Vq8192ToMels.json"
+    fmt_ckpt_path = os.path.join(local_dir, "acoustic_modeling/Vq8192ToMels")
+
+    local_dir = snapshot_download(
+        repo_id="amphion/Vevo",
+        repo_type="model",
+        cache_dir="./ckpts/Vevo",
+        allow_patterns=["acoustic_modeling/Vocoder/*"],
+    )
+    vocoder_cfg_path = "./models/vc/vevo/config/Vocoder.json"
+    vocoder_ckpt_path = os.path.join(local_dir, "acoustic_modeling/Vocoder")
+
+    # Initialize pipeline
+    inference_pipeline = VevoInferencePipeline(
+        content_style_tokenizer_ckpt_path=content_style_tokenizer_ckpt_path,
+        ar_cfg_path=ar_cfg_path,
+        ar_ckpt_path=ar_ckpt_path,
+        fmt_cfg_path=fmt_cfg_path,
+        fmt_ckpt_path=fmt_ckpt_path,
+        vocoder_cfg_path=vocoder_cfg_path,
+        vocoder_ckpt_path=vocoder_ckpt_path,
+        device=device,
+    )
+
+    # Inputs
+    src_text = "I don't really care what you call me. I've been a silent spectator, watching species evolve, empires rise and fall."
+    ref_text = "Flip stood undecided, his ears strained to catch the slightest sound."
+    blend_text = "Flip turned quickly, startled by the faint whisper behind him."
+
+    ref_wav_path = "./models/vc/vevo/wav/arabic_male.wav"
+    output_path = "./models/vc/vevo/wav/output_ar_inpaint.wav"
+
+    vevo_inpaint_ar(
+        src_text=src_text,
+        ref_wav_path=ref_wav_path,
+        ref_text=ref_text,
+        blend_text=blend_text,
+        output_path=output_path,
+        region_tokens=(10, 20),  # Replace token indices 10â20 in the source portion
+    )
+
 def run_ar(self, src_text, style_ref_wav_path, style_ref_text, src_lang, ref_lang):
     """
     Generate AR tokens from concatenated [style_ref_text + src_text].
