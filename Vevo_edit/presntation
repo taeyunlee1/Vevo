@@ -1,0 +1,136 @@
+🎯 Goal
+------
+Enable precise audio region editing by modifying AR tokens instead of mel frames — solving the mismatch in timing and semantics between different voices.
+
+📁 Files Modified
+----------------
+- `vevo_utils.py` → added `run_ar()` and `run_fm_with_ar_tokens()` to support AR-token-based editing.
+- `infer_vevotts.py` → replaced mel-frame CFG with token-based inpainting logic.
+- Added support for blending voices semantically aligned via AR tokens.
+
+🧪 Attempt A: Frame-level CFG Blending (Failed)
+----------------------------------------------
+- Used mel frame `region=(start, end)` with `cfg_scale` to interpolate FM predictions.
+- Problem: Voice speed mismatch → tokens don't represent same content → audio sounds doubled/garbled.
+
+🧪 Attempt B: Voice Blending via Prompt Mel Alignment (Failed)
+-------------------------------------------------------------
+- Tried blending `prompt` mels using 0.5 * mel1 + 0.5 * mel2.
+- Issue: No semantic alignment; different timbre/speed led to incoherent result.
+
+✅ Final Working Solution: AR Token Inpainting
+---------------------------------------------
+- Generate AR tokens from `[ref_text + src_text]`.
+- Identify bad region (e.g., token 45–63) via Whisper timestamps + `seconds_to_ar_token_range()`.
+- Replace just those AR tokens using a regenerated version from `blend_text`.
+- Feed updated tokens into `run_fm_with_ar_tokens()` to get final audio.
+
+🔧 New Functions Added
+---------------------
+- `VevoInferencePipeline.run_ar(...)` → returns (tokens, ref_len)
+- `VevoInferencePipeline.run_fm_with_ar_tokens(...)` → skips AR model, takes tokens directly
+- `extract_prompt_mel_feature()` → added to use AR-specific mel config
+- `seconds_to_ar_token_range(start, end, num_tokens, duration)` → maps audio time → token index
+
+🗣 Whisper Integration
+---------------------
+- Added transcription helper using `whisper.transcribe(word_timestamps=True)`.
+- Maps spoken words to `(start_time, end_time)` to help align edits with AR tokens.
+
+🐳 Docker Fix
+------------
+- Installed `ffmpeg` inside Docker container via `apt install -y ffmpeg` so Whisper works.
+
+📌 Usage Tips
+------------
+- `ar_tokens.shape[1]` gives total number of tokens.
+- `ref_len` from `run_ar()` tells you where source text starts.
+- Use `Whisper` to align bad audio to token regions before editing.
+
+📅 Date
+------
+2025-07-23
+
+🎛 CFG Attempts & Evolution
+--------------------------
+You originally experimented with CFG (Classifier-Free Guidance) by modifying the `reverse_diffusion()` method in `FlowMatchingTransformer`.
+
+Initial CFG mechanism:
+- Based on CosyVoice-style guidance: `flow_pred_cfg = flow_pred + cfg * (flow_pred - uncond_flow_pred)`
+- Introduced `rescale_cfg` to stabilize overly strong guidance
+- Goal: replace or denoise only selected mel-frame regions
+
+Problems:
+- Voice speed/timing mismatch made the same mel frame range in different reference audios correspond to **different semantic content**
+- Result: overlapping voices or distorted phrasing
+
+---
+
+🧪 CFG Attempt 1: Frame-wise Replacement
+- Used `region=(start, end)` and `cfg_scale=2.5` to boost or correct a subregion
+- Code:
+    pred[:, start:end, :] = (1 + cfg_scale) * pred[:, start:end, :] - cfg_scale * bad_eps[:, start:end, :]
+- Outcome: Partial success; sounded like two voices layered out-of-sync
+
+---
+
+🧪 CFG Attempt 2: Global Prompt Mixing
+- Blended prompt mels: `prompt = alpha * mel1 + (1-alpha) * mel2`
+- Goal: interpolate timbre and expression before diffusion starts
+- Outcome: Less noise, but incoherent style/speed → mushy or glitchy audio
+
+---
+
+🧪 CFG Attempt 3: Soft CFG on Full Mel Sequence
+- Tried applying CFG not only in `[start:end]` but across all timesteps with smooth weighting
+- Outcome: Slightly more stable but still semantically broken when reference had different pacing
+
+---
+
+✅ Insight → Why It Didn't Work:
+- CFG assumes that “prompt and no-prompt” representations share **semantic timing**
+- When using two different voices (with different pacing), same mel index ≠ same content
+- Thus, manipulating mel frames directly doesn’t let you **semantically inpaint** speech
+
+➡ Final solution was to move CFG-style interpolation into **AR token space**, where timing and word boundaries are preserved.
+
+📄 Key Code Snippets
+-------------------
+--- CFG on Mel Frames (Old)
+pred[:, start:end, :] = (
+    (1 + cfg_scale) * pred[:, start:end, :] - cfg_scale * bad_eps[:, start:end, :]
+)
+
+--- CFG-style Flow Matching Guidance (Reverse Diffusion)
+if cfg > 0:
+    uncond_flow_pred = self.diff_estimator(
+        xt, t, torch.zeros_like(cond)[:, :xt.shape[1], :], x_mask
+    )
+    flow_pred_cfg = flow_pred + cfg * (flow_pred - uncond_flow_pred)
+    flow_pred = rescale_cfg * (
+        flow_pred_cfg * flow_pred.std() / (flow_pred_cfg.std() + 1e-5)
+    ) + (1 - rescale_cfg) * flow_pred_cfg
+
+--- AR Token Replacement (New)
+ar_tokens, ref_len = inference_pipeline.run_ar(...)
+reblend_tokens, _ = inference_pipeline.run_ar(blend_text, ...)
+ar_tokens[:, ref_len+start:ref_len+end] = reblend_tokens[:, ref_len+start:ref_len+end]
+
+--- Run FMT using Token-Level Replacement
+audio = inference_pipeline.run_fm_with_ar_tokens(
+    predicted_codecs=ar_tokens,
+    timbre_ref_wav_path="wav/mandarin_female.wav",
+    output_path="wav/output_final.wav",
+)
+
+--- Whisper Timestamp Mapping
+timestamps = transcribe_with_word_timestamps("output.wav")
+print(timestamps)
+
+--- Time to Token Index Mapping
+start, end = seconds_to_ar_token_range(
+    start_time=1.5,
+    end_time=2.1,
+    num_tokens=96,
+    audio_duration=3.2
+)
