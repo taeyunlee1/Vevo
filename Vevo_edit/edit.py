@@ -1,3 +1,52 @@
+def run_ar(self, src_text, style_ref_wav_path, style_ref_text, src_lang, ref_lang):
+    """
+    Generate AR tokens from concatenated [style_ref_text + src_text].
+    Returns:
+        - predicted_codecs: [1, T]
+        - ref_token_len: int (how long the reference portion is)
+    """
+    style_ref_speech, _, style_ref_speech16k = load_wav(style_ref_wav_path, self.device)
+
+    ref_ids = g2p_(style_ref_text, ref_lang)[1]
+    src_ids = g2p_(src_text, src_lang)[1]
+
+    style_ref_tensor = torch.tensor([ref_ids], dtype=torch.long).to(self.device)
+    src_tensor = torch.tensor([src_ids], dtype=torch.long).to(self.device)
+    input_ids = torch.cat([style_ref_tensor, src_tensor], dim=1)
+
+    with torch.no_grad():
+        pred_codecs = self.ar_model.generate(
+            input_ids=input_ids,
+            prompt_output_ids=style_ref_tensor,
+            prompt_mels=self.extract_prompt_mel_feature(style_ref_speech16k),
+        )
+
+    return pred_codecs, len(ref_ids)
+
+
+def run_fm_with_ar_tokens(self, ar_tokens, timbre_ref_wav_path, flow_matching_steps=32):
+    """
+    Run flow matching decoder using AR tokens directly.
+    """
+    timbre_speech, timbre_speech24k, timbre_speech16k = load_wav(timbre_ref_wav_path, self.device)
+    timbre_codecs = self.extract_hubert_codec(timbre_speech16k)
+
+    diffusion_input_codecs = torch.cat([timbre_codecs, ar_tokens], dim=1)
+    cond = self.fmt_model.cond_emb(diffusion_input_codecs)
+    prompt = self.extract_mel_feature(timbre_speech24k)
+
+    with torch.no_grad():
+        pred_mel = self.fmt_model.reverse_diffusion(
+            cond=cond,
+            prompt=prompt,
+            n_timesteps=flow_matching_steps,
+        )
+
+    mel = pred_mel.transpose(1, 2)
+    audio = self.vocoder_model(mel).detach().cpu()[0]
+    return audio
+
+
 if blend_pred is not None:
     pred[:, start:end, :] = blend_pred[:, start:end, :]
     
