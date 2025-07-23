@@ -1,3 +1,27 @@
+if blend_pred is not None:
+    pred[:, start:end, :] = blend_pred[:, start:end, :]
+    
+    
+if blend_pred is not None:
+    region_len = end - start
+    fade = torch.linspace(0, 1, region_len, device=pred.device).unsqueeze(0).unsqueeze(-1)  # [1, T, 1]
+
+    original = pred[:, start:end, :]
+    blended = blend_pred[:, start:end, :]
+
+    pred[:, start:end, :] = (1 - fade) * original + fade * blended
+
+if blend_pred is not None:
+    # Normalize blend_pred to match pred's std
+    pred_std = pred[:, start:end, :].std()
+    blend_std = blend_pred[:, start:end, :].std()
+    blend_scaled = blend_pred[:, start:end, :] * (pred_std / (blend_std + 1e-6))
+
+    pred[:, start:end, :] = (
+        (1 - cfg_scale) * pred[:, start:end, :] + cfg_scale * blend_scaled
+    )
+
+
 def run_fm(self, predicted_codecs, timbre_ref_wav_path, bad_eps=None, region=None, cfg_scale=0.0, flow_matching_steps=32, blend_wav_path=None):
     timbre_speech, timbre_speech24k, timbre_speech16k = load_wav(timbre_ref_wav_path, self.device)
     timbre_codecs = self.extract_hubert_codec(timbre_speech16k)
